@@ -2,6 +2,7 @@ require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
 const express = require("express");
+const cors = require("cors");
 const { SpeechClient } = require("@google-cloud/speech");
 const { Translate } = require("@google-cloud/translate").v2;
 const http = require("http");
@@ -24,14 +25,15 @@ if (process.env.GOOGLE_KEY_JSON) {
   }
 }
 
-// --- Express app (opcional, te deja endpoints HTTP si quieres)
+// --- Express app
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use(cors()); // Permitir requests desde cualquier origen
 
 const PORT = Number(process.env.PORT || 3000);
 
-// --- Inicializa clientes Google (usar GOOGLE_KEY_PATH)
+// --- Inicializa clientes Google
 const keyFilename = process.env.GOOGLE_KEY_PATH || undefined;
 const clientSTT = new SpeechClient({ keyFilename });
 const clientTranslate = new Translate({ keyFilename });
@@ -44,19 +46,19 @@ server.listen(PORT, () => {
   console.log("🚀 Backend iniciado, esperando conexiones...\n".yellow);
 });
 
-// --- WebSocket server atachado al mismo server (soporta wss en Render)
+// --- WebSocket server atachado al mismo server
 const wss = new WebSocket.Server({ server });
 console.log(`🟢 WebSocket listo (attach to same HTTP server).`.cyan);
 
-// Optional health endpoint
+// --- Health endpoint
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// Rooms map for later multi-call isolation (callID -> [ws])
-const rooms = {}; // simple in-memory map
+// --- Rooms map
+const rooms = {}; // callID -> Set<ws>
 
 wss.on("connection", (ws, req) => {
-  // parse callID from querystring if provided: ws://host:port/?callID=abc
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  // parse callID from querystring
+  const url = new URL(req.url, `https://${req.headers.host}`);
   const callID = url.searchParams.get("callID") || "default";
 
   console.log(`[${now()}] 🤝 Cliente conectado (callID=${callID})`.green);
@@ -82,7 +84,6 @@ wss.on("connection", (ws, req) => {
       const texto = data.results[0]?.alternatives[0]?.transcript || "";
       if (texto) {
         try {
-          // translate to english
           const [traduccion] = await clientTranslate.translate(texto, "en");
 
           console.log(`[${now()}] 🎧 Texto reconocido:`.magenta, texto);
@@ -95,7 +96,6 @@ wss.on("connection", (ws, req) => {
             timestamp: new Date().toISOString(),
           });
 
-          // send only to clients in the same room
           rooms[callID].forEach((client) => {
             if (client.readyState === WebSocket.OPEN) client.send(payload);
           });
@@ -106,14 +106,11 @@ wss.on("connection", (ws, req) => {
     });
 
   ws.on("message", (msg) => {
-    // Expect binary audio chunks (Buffer). Forward to STT stream.
     if (Buffer.isBuffer(msg) || msg instanceof Buffer) {
       console.log(`[${now()}] 📦 Chunk recibido: ${msg.length} bytes (callID=${callID})`.blue);
       recognizeStream.write(msg);
     } else {
-      // Could be text control messages (e.g., "end", or "callID" handshake)
       console.log(`[${now()}] 🔁 Mensaje de control:`, msg.toString());
-      // Handle control messages if you add any
     }
   });
 
