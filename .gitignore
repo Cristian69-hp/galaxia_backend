@@ -1,0 +1,30 @@
+# Node.js dependencies
+node_modules/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Environment variables
+.env
+
+# Google Cloud Service Account Keys
+google-key.json
+
+# Uploaded files (opcional, si no quieres subirlos)
+uploads/
+
+# MacOS system files
+.DS_Store
+
+# VSCode settings
+.vscode/
