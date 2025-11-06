@@ -56,18 +56,25 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 // --- Rooms map
 const rooms = {}; // callID -> Set<ws>
 
+// --- Mantener conexiones activas (Render a veces cierra por inactividad)
+setInterval(() => {
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) client.ping();
+  });
+}, 25000);
+
+// --- Manejador principal de conexiones WebSocket
 wss.on("connection", (ws, req) => {
-  // parse callID from querystring
   const url = new URL(req.url, `https://${req.headers.host}`);
   const callID = url.searchParams.get("callID") || "default";
 
   console.log(`[${now()}] 🤝 Cliente conectado (callID=${callID})`.green);
 
-  // register socket in room
+  // Registrar el socket en su "sala"
   if (!rooms[callID]) rooms[callID] = new Set();
   rooms[callID].add(ws);
 
-  // create a single recognizeStream per connection
+  // Crear un recognizeStream por conexión
   const recognizeStream = clientSTT
     .streamingRecognize({
       config: {
@@ -78,7 +85,8 @@ wss.on("connection", (ws, req) => {
       interimResults: true,
     })
     .on("error", (err) => {
-      console.error(`[${now()}] ❌ Error STT:`.red, err);
+      console.error(`[${now()}] ❌ Error STT:`.red, err.message);
+      if (!recognizeStream.destroyed) recognizeStream.destroy();
     })
     .on("data", async (data) => {
       const texto = data.results[0]?.alternatives[0]?.transcript || "";
@@ -91,7 +99,7 @@ wss.on("connection", (ws, req) => {
 
           const payload = JSON.stringify({
             texto_original: texto,
-            traduccion: traduccion,
+            traduccion,
             callID,
             timestamp: new Date().toISOString(),
           });
@@ -100,32 +108,47 @@ wss.on("connection", (ws, req) => {
             if (client.readyState === WebSocket.OPEN) client.send(payload);
           });
         } catch (err) {
-          console.error(`[${now()}] ⚠️ Error traduciendo/enviando:`, err);
+          console.error(`[${now()}] ⚠️ Error traduciendo/enviando:`, err.message);
         }
       }
     });
 
+  // --- Recepción de chunks de audio
   ws.on("message", (msg) => {
-    if (Buffer.isBuffer(msg) || msg instanceof Buffer) {
-      console.log(`[${now()}] 📦 Chunk recibido: ${msg.length} bytes (callID=${callID})`.blue);
-      recognizeStream.write(msg);
-    } else {
-      console.log(`[${now()}] 🔁 Mensaje de control:`, msg.toString());
+    try {
+      if (Buffer.isBuffer(msg)) {
+        if (recognizeStream.writable && !recognizeStream.destroyed) {
+          recognizeStream.write(msg);
+          console.log(`[${now()}] 📦 Chunk recibido: ${msg.length} bytes (callID=${callID})`.blue);
+        } else {
+          console.warn(`[${now()}] ⛔ Stream no disponible, chunk descartado`.yellow);
+        }
+      } else {
+        console.log(`[${now()}] 🔁 Mensaje de control:`, msg.toString());
+      }
+    } catch (err) {
+      console.error(`[${now()}] ❌ Error escribiendo en stream:`, err.message);
     }
   });
 
+  // --- Cierre del socket
   ws.on("close", () => {
+    console.log(`[${now()}] 🔴 Cliente desconectado (callID=${callID})`.gray);
     try {
-      recognizeStream.end();
-    } catch (e) {}
+      if (recognizeStream.writable && !recognizeStream.destroyed) recognizeStream.end();
+    } catch (e) {
+      console.warn(`[${now()}] ⚠️ Error al cerrar stream:`, e.message);
+    }
+
     if (rooms[callID]) {
       rooms[callID].delete(ws);
       if (rooms[callID].size === 0) delete rooms[callID];
     }
-    console.log(`[${now()}] 🔴 Cliente desconectado (callID=${callID})`.gray);
   });
 
+  // --- Errores del socket
   ws.on("error", (err) => {
     console.error(`[${now()}] ⚠️ Error socket:`, err.message);
+    if (!recognizeStream.destroyed) recognizeStream.destroy();
   });
 });
