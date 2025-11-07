@@ -11,153 +11,158 @@ const colors = require("colors");
 
 const now = () => new Date().toISOString().split("T")[1].split(".")[0];
 
-// --- Escribir GOOGLE_KEY_JSON si viene en el entorno
+// 🔹 Configura clave Google si viene del entorno
 if (process.env.GOOGLE_KEY_JSON) {
-  try {
-    const keyPath = path.join(__dirname, "google-key-from-env.json");
-    fs.writeFileSync(keyPath, process.env.GOOGLE_KEY_JSON, { encoding: "utf8" });
-    process.env.GOOGLE_KEY_PATH = keyPath;
-    console.log(`[${now()}] 🔐 GOOGLE_KEY_JSON escrita a ${keyPath}`);
-  } catch (err) {
-    console.error(`[${now()}] ❌ Error escribiendo GOOGLE_KEY_JSON:`, err);
-  }
+  const keyPath = path.join(__dirname, "google-key-from-env.json");
+  fs.writeFileSync(keyPath, process.env.GOOGLE_KEY_JSON, { encoding: "utf8" });
+  process.env.GOOGLE_KEY_PATH = keyPath;
+  console.log(`[${now()}] 🔐 GOOGLE_KEY_JSON escrita a ${keyPath}`);
 }
 
-// --- Express app
+// --- Express + HTTP Server
 const app = express();
 app.use(express.json());
 app.use(cors());
 
 const PORT = Number(process.env.PORT || 3000);
-
-// --- Inicializa clientes Google
 const keyFilename = process.env.GOOGLE_KEY_PATH || undefined;
+
+// --- Inicializa los clientes de Google
 const clientSTT = new SpeechClient({ keyFilename });
 const clientTranslate = new Translate({ keyFilename });
 
-// --- HTTP + WebSocket server
+// --- HTTP + WebSocket Server
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
-
 server.listen(PORT, () => {
-  console.log(`✅ Servidor HTTP corriendo en puerto ${PORT}`.green);
-  console.log("🚀 Backend iniciado, esperando conexiones...\n".yellow);
+  console.log(`✅ Servidor HTTP en puerto ${PORT}`.green);
+  console.log("🚀 Esperando conexiones WebSocket...\n".yellow);
 });
 
-// --- Endpoint de salud
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-// --- Mapa de salas y streams
+// --- Estructuras de conexión
 const rooms = {}; // callID -> Set<ws>
-const streams = {}; // callID -> recognizeStream
+const userMeta = {}; // ws -> { callID, userID, sourceLang, targetLang }
+const userStreams = {}; // ws -> recognizeStream
 
-// --- Mantener viva la conexión
+// Mantener conexión viva
 setInterval(() => {
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) client.ping();
-  });
+  wss.clients.forEach((c) => c.readyState === WebSocket.OPEN && c.ping());
 }, 25000);
 
-// --- Crear un stream de reconocimiento para una sesión
-function createRecognizeStream(callID) {
-  console.log(`[${now()}] 🎙️ Creando recognizeStream para ${callID}`.yellow);
+// --- Crear stream de reconocimiento individual
+function createRecognizeStream(ws, { callID, userID, sourceLang, targetLang }) {
+  console.log(
+    `[${now()}] 🎙️ Creando STT para ${userID} (${sourceLang} → ${targetLang})`.yellow
+  );
 
   const recognizeStream = clientSTT
     .streamingRecognize({
       config: {
         encoding: "LINEAR16",
         sampleRateHertz: 16000,
-        languageCode: "es-ES",
+        languageCode: sourceLang,
       },
       interimResults: true,
     })
     .on("error", (err) => {
-      console.error(`[${now()}] ❌ Error STT (${callID}):`, err.message);
-      if (!recognizeStream.destroyed) recognizeStream.destroy();
+      console.error(`[${now()}] ❌ Error STT (${userID}):`, err.message);
     })
     .on("data", async (data) => {
       const texto = data.results[0]?.alternatives[0]?.transcript || "";
       if (!texto) return;
 
       try {
-        const [traduccion] = await clientTranslate.translate(texto, "en");
-
-        console.log(`[${now()}] 🎧 (${callID}) Texto: `.magenta + texto);
-        console.log(`[${now()}] 🌎 Traducción: `.cyan + traduccion);
+        // Traducción según idioma destino
+        const [traduccion] = await clientTranslate.translate(texto, targetLang);
 
         const payload = JSON.stringify({
+          userID,
           texto_original: texto,
           traduccion,
-          callID,
+          sourceLang,
+          targetLang,
           timestamp: new Date().toISOString(),
         });
 
-        // Enviar solo a los clientes del room
+        // Enviar a todos los usuarios en el mismo room
         rooms[callID]?.forEach((client) => {
-          if (client.readyState === WebSocket.OPEN) client.send(payload);
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(payload);
+          }
         });
-      } catch (err) {
-        console.error(`[${now()}] ⚠️ Error traduciendo (${callID}):`, err.message);
+
+        console.log(`[${now()}] 🗣️ ${userID}: ${texto}`);
+        console.log(`[${now()}] 🌍 ${userID} (${sourceLang}→${targetLang}): ${traduccion}`);
+      } catch (e) {
+        console.error(`[${now()}] ⚠️ Error traduciendo (${userID}):`, e.message);
       }
     });
 
-  streams[callID] = recognizeStream;
+  userStreams[ws] = recognizeStream;
   return recognizeStream;
 }
 
 // --- WebSocket connection
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url, `https://${req.headers.host}`);
+
   const callID = url.searchParams.get("callID") || "default";
+  const userID = url.searchParams.get("userID") || `u_${Date.now()}`;
+  const sourceLang = url.searchParams.get("sourceLang") || "es";
+  const targetLang = url.searchParams.get("targetLang") || "en";
 
-  console.log(`[${now()}] 🤝 Cliente conectado (callID=${callID})`.green);
+  console.log(`[${now()}] 🤝 ${userID} conectado a llamada ${callID}`.green);
 
-  // --- Añadir cliente a su sala
+  // --- Añadir usuario al room
   if (!rooms[callID]) rooms[callID] = new Set();
   rooms[callID].add(ws);
 
-  // --- Crear stream compartido si no existe
-  const recognizeStream = streams[callID] || createRecognizeStream(callID);
+  // --- Guardar sus datos
+  userMeta[ws] = { callID, userID, sourceLang, targetLang };
 
-  // --- Manejar audio recibido
+  // --- Crear su stream de reconocimiento
+  const recognizeStream = createRecognizeStream(ws, userMeta[ws]);
+
+  // --- Manejar mensajes (audio)
   ws.on("message", (msg) => {
-    if (!Buffer.isBuffer(msg)) {
-      console.log(`[${now()}] 📩 Mensaje control:`, msg.toString());
-      return;
-    }
-
-    if (recognizeStream.writable && !recognizeStream.destroyed) {
+    if (Buffer.isBuffer(msg)) {
       recognizeStream.write(msg);
-      console.log(`[${now()}] 🎤 Audio ${msg.length} bytes -> ${callID}`.blue);
     } else {
-      console.warn(`[${now()}] ⚠️ Stream no disponible para ${callID}`.yellow);
+      console.log(`[${now()}] 📩 Mensaje control (${userID}):`, msg.toString());
     }
   });
 
-  // --- Cuando un cliente se desconecta
+  // --- Al cerrar conexión
   ws.on("close", () => {
-    console.log(`[${now()}] 🔴 Cliente desconectado (callID=${callID})`.gray);
+    console.log(`[${now()}] 🔴 ${userID} desconectado`.gray);
 
+    // Cerrar stream del usuario
+    try {
+      userStreams[ws]?.end();
+      userStreams[ws]?.destroy();
+    } catch (e) {
+      console.warn(`[${now()}] ⚠️ Error cerrando stream: ${e.message}`);
+    }
+
+    delete userStreams[ws];
+    delete userMeta[ws];
+
+    // Eliminar del room
     if (rooms[callID]) {
       rooms[callID].delete(ws);
       if (rooms[callID].size === 0) {
-        // Cerrar stream cuando todos salen
-        console.log(`[${now()}] 🧹 Cerrando stream de ${callID}`.yellow);
-        if (streams[callID]) {
-          try {
-            streams[callID].end();
-            streams[callID].destroy();
-          } catch (err) {
-            console.warn(`[${now()}] ⚠️ Error al cerrar stream (${callID}):`, err.message);
-          }
-          delete streams[callID];
-        }
+        console.log(`[${now()}] 🧹 Cerrando room vacío ${callID}`.yellow);
         delete rooms[callID];
       }
     }
   });
 
   ws.on("error", (err) => {
-    console.error(`[${now()}] ⚠️ Error socket (${callID}):`, err.message);
+    console.error(`[${now()}] ⚠️ WS error (${userID}):`, err.message);
   });
+});
+
+// --- Endpoint de salud
+app.get("/health", (req, res) => {
+  res.json({ ok: true, time: new Date().toISOString() });
 });
