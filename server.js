@@ -11,6 +11,7 @@ const colors = require("colors");
 
 const now = () => new Date().toISOString().split("T")[1].split(".")[0];
 
+// 🔹 Configura clave Google si viene del entorno
 if (process.env.GOOGLE_KEY_JSON) {
   const keyPath = path.join(__dirname, "google-key-from-env.json");
   fs.writeFileSync(keyPath, process.env.GOOGLE_KEY_JSON, { encoding: "utf8" });
@@ -18,11 +19,14 @@ if (process.env.GOOGLE_KEY_JSON) {
   console.log(`[${now()}] 🔐 GOOGLE_KEY_JSON escrita a ${keyPath}`);
 }
 
+// 🌍 Función para normalizar códigos de idioma
 function normalizarCodigoIdioma(codigo) {
+  // Si ya viene en formato completo (es-ES, en-US), retornar tal cual
   if (codigo && codigo.includes('-') && codigo.length > 2) {
     return codigo;
   }
 
+  // Mapeo de códigos cortos a formato completo para Google APIs
   const mapeo = {
     'es': 'es-ES',
     'en': 'en-US',
@@ -38,14 +42,17 @@ function normalizarCodigoIdioma(codigo) {
   return mapeo[codigoLower] || 'en-US';
 }
 
+// 🔄 Función para extraer código corto de idioma (para traducción)
 function extraerCodigoCorto(codigo) {
   if (!codigo) return 'en';
+  // Si viene "es-ES", extraer solo "es"
   if (codigo.includes('-')) {
     return codigo.split('-')[0];
   }
   return codigo;
 }
 
+// --- Express + HTTP Server
 const app = express();
 app.use(express.json());
 app.use(cors());
@@ -53,9 +60,11 @@ app.use(cors());
 const PORT = Number(process.env.PORT || 3000);
 const keyFilename = process.env.GOOGLE_KEY_PATH || undefined;
 
+// --- Inicializa los clientes de Google
 const clientSTT = new SpeechClient({ keyFilename });
 const clientTranslate = new Translate({ keyFilename });
 
+// --- HTTP + WebSocket Server
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 server.listen(PORT, () => {
@@ -63,172 +72,76 @@ server.listen(PORT, () => {
   console.log("🚀 Esperando conexiones WebSocket...\n".yellow);
 });
 
-const rooms = {};
-const userMeta = {};
-const userStreams = {}; // ws -> { stream, lastAudioTime, isRestarting, inactivityTimer }
+// --- Estructuras de conexión
+const rooms = {}; // callID -> Set<ws>
+const userMeta = {}; // ws -> { callID, userID, sourceLang, targetLang }
+const userStreams = {}; // ws -> recognizeStream
 
+// Mantener conexión viva
 setInterval(() => {
   wss.clients.forEach((c) => c.readyState === WebSocket.OPEN && c.ping());
 }, 25000);
 
+// --- Crear stream de reconocimiento individual
 function createRecognizeStream(ws, { callID, userID, sourceLang, targetLang }) {
+  // Normalizar códigos de idioma para Google STT
   const sourceLangNormalizado = normalizarCodigoIdioma(sourceLang);
   const targetLangCorto = extraerCodigoCorto(targetLang);
 
-  console.log(`[${now()}] 🎙️ STT: ${userID} (${sourceLang} → ${targetLang})`.yellow);
-
-  let ultimoTextoProcesado = "";
-  let ultimoTimestamp = Date.now();
+  console.log(
+    `[${now()}] 🎙️ Creando STT para ${userID}`.yellow
+  );
+  console.log(`[${now()}]    - sourceLang original: ${sourceLang} -> normalizado: ${sourceLangNormalizado}`);
+  console.log(`[${now()}]    - targetLang original: ${targetLang} -> código corto: ${targetLangCorto}`);
 
   const recognizeStream = clientSTT
     .streamingRecognize({
       config: {
         encoding: "LINEAR16",
         sampleRateHertz: 16000,
-        languageCode: sourceLangNormalizado,
-        enableAutomaticPunctuation: true,
-        useEnhanced: true,
-        model: 'latest_short',
+        languageCode: sourceLangNormalizado, // ✅ Ahora usa código completo
       },
       interimResults: true,
     })
     .on("error", (err) => {
       console.error(`[${now()}] ❌ Error STT (${userID}):`, err.message);
-      
-      // 🔥 RECREAR STREAM SI HAY TIMEOUT
-      if ((err.message.includes("Audio Timeout") || err.message.includes("duration elapsed")) 
-          && userStreams[ws] && !userStreams[ws].isRestarting) {
-        
-        console.log(`[${now()}] 🔄 Timeout detectado, recreando stream para ${userID}...`.yellow);
-        userStreams[ws].isRestarting = true;
-        
-        // Limpiar stream viejo
-        try {
-          recognizeStream.removeAllListeners();
-          recognizeStream.end();
-          recognizeStream.destroy();
-        } catch (e) {}
-        
-        // Crear nuevo stream después de un delay
-        setTimeout(() => {
-          if (userMeta[ws] && userStreams[ws]) {
-            const newStream = createRecognizeStream(ws, userMeta[ws]);
-            userStreams[ws].stream = newStream;
-            userStreams[ws].isRestarting = false;
-            userStreams[ws].lastAudioTime = Date.now();
-            console.log(`[${now()}] ✅ Stream recreado para ${userID}`.green);
-          }
-        }, 1000);
-      }
     })
     .on("data", async (data) => {
+      const texto = data.results[0]?.alternatives[0]?.transcript || "";
+      if (!texto) return;
+
       try {
-        const result = data.results[0];
-        if (!result) return;
-
-        const texto = result.alternatives[0]?.transcript || "";
-        if (!texto) return;
-
-        const isFinal = result.isFinal;
-        
-        // Actualizar timestamp
-        if (userStreams[ws]) {
-          userStreams[ws].lastAudioTime = Date.now();
-        }
-        
-        const ahora = Date.now();
-        const tiempoDesdeUltimo = ahora - ultimoTimestamp;
-        
-        if (!isFinal && tiempoDesdeUltimo < 800) {
-          return;
-        }
-
-        if (texto === ultimoTextoProcesado && tiempoDesdeUltimo < 1500) {
-          return;
-        }
-
-        ultimoTextoProcesado = texto;
-        ultimoTimestamp = ahora;
-
+        // Traducción usando código corto (Google Translate usa códigos cortos)
         const [traduccion] = await clientTranslate.translate(texto, targetLangCorto);
 
         const payload = JSON.stringify({
           userID,
           texto_original: texto,
           traduccion,
-          sourceLang: sourceLangNormalizado,
+          sourceLang: sourceLangNormalizado, // Enviar código completo al cliente
           targetLang: targetLangCorto,
           timestamp: new Date().toISOString(),
-          isFinal,
         });
 
+        // Enviar a todos los usuarios en el mismo room
         rooms[callID]?.forEach((client) => {
           if (client.readyState === WebSocket.OPEN) {
             client.send(payload);
           }
         });
 
-        if (isFinal) {
-          console.log(`[${now()}] ✅ ${userID}: ${texto} → ${traduccion}`.cyan);
-        }
+        console.log(`[${now()}] 🗣️ ${userID}: ${texto}`.cyan);
+        console.log(`[${now()}] 🌍 Traducción (${sourceLangNormalizado}→${targetLangCorto}): ${traduccion}`.green);
       } catch (e) {
-        console.error(`[${now()}] ⚠️ Error (${userID}):`, e.message);
+        console.error(`[${now()}] ⚠️ Error traduciendo (${userID}):`, e.message);
       }
-    })
-    .on("end", () => {
-      console.log(`[${now()}] 🔚 Stream ended para ${userID}`.gray);
     });
 
-  // Guardar stream
-  if (!userStreams[ws]) {
-    userStreams[ws] = {
-      stream: recognizeStream,
-      lastAudioTime: Date.now(),
-      isRestarting: false,
-      inactivityTimer: null
-    };
-  } else {
-    userStreams[ws].stream = recognizeStream;
-    userStreams[ws].isRestarting = false;
-  }
-
-  // 🔥 MONITOREO PREVENTIVO DE INACTIVIDAD
-  // Limpiar timer previo si existe
-  if (userStreams[ws].inactivityTimer) {
-    clearInterval(userStreams[ws].inactivityTimer);
-  }
-
-  userStreams[ws].inactivityTimer = setInterval(() => {
-    if (!userStreams[ws] || !userMeta[ws] || userStreams[ws].isRestarting) {
-      return;
-    }
-
-    const timeSinceLastAudio = Date.now() - userStreams[ws].lastAudioTime;
-    
-    // Si han pasado más de 20 segundos sin audio, recrear preventivamente
-    if (timeSinceLastAudio > 20000) {
-      console.log(`[${now()}] ⏰ Inactividad ${Math.floor(timeSinceLastAudio/1000)}s para ${userID}, recreando...`.yellow);
-      
-      userStreams[ws].isRestarting = true;
-      
-      try {
-        recognizeStream.removeAllListeners();
-        recognizeStream.end();
-        recognizeStream.destroy();
-      } catch (e) {}
-      
-      setTimeout(() => {
-        if (userMeta[ws] && userStreams[ws]) {
-          const newStream = createRecognizeStream(ws, userMeta[ws]);
-          console.log(`[${now()}] ♻️ Stream preventivo creado para ${userID}`.green);
-        }
-      }, 500);
-    }
-  }, 8000); // Revisar cada 8 segundos
-
+  userStreams[ws] = recognizeStream;
   return recognizeStream;
 }
 
+// --- WebSocket connection
 wss.on("connection", (ws, req) => {
   const url = new URL(req.url, `https://${req.headers.host}`);
 
@@ -237,52 +150,36 @@ wss.on("connection", (ws, req) => {
   const sourceLang = url.searchParams.get("sourceLang") || "es";
   const targetLang = url.searchParams.get("targetLang") || "en";
 
-  console.log(`[${now()}] 🤝 ${userID} → ${callID}`.green);
+  console.log(`[${now()}] 🤝 ${userID} conectado a llamada ${callID}`.green);
+  console.log(`[${now()}]    - Configuración: ${sourceLang} → ${targetLang}`);
 
+  // --- Añadir usuario al room
   if (!rooms[callID]) rooms[callID] = new Set();
   rooms[callID].add(ws);
 
+  // --- Guardar sus datos
   userMeta[ws] = { callID, userID, sourceLang, targetLang };
 
-  createRecognizeStream(ws, userMeta[ws]);
+  // --- Crear su stream de reconocimiento
+  const recognizeStream = createRecognizeStream(ws, userMeta[ws]);
 
+  // --- Manejar mensajes (audio)
   ws.on("message", (msg) => {
     if (Buffer.isBuffer(msg)) {
-      // 🔥 CRITICAL: Solo escribir si el stream NO está reiniciándose
-      if (userStreams[ws] && !userStreams[ws].isRestarting) {
-        userStreams[ws].lastAudioTime = Date.now();
-        
-        try {
-          const stream = userStreams[ws].stream;
-          // Verificar que el stream existe, no está destruido y no está ended
-          if (stream && !stream.destroyed && stream.writable) {
-            stream.write(msg);
-          }
-        } catch (e) {
-          // Silenciar errores de escritura durante transición
-          if (!e.message.includes("write after end")) {
-            console.error(`[${now()}] ⚠️ Error escribiendo (${userID}):`, e.message);
-          }
-        }
-      }
-      // Si está reiniciándose, simplemente descartar el audio
+      recognizeStream.write(msg);
+    } else {
+      console.log(`[${now()}] 📩 Mensaje control (${userID}):`, msg.toString());
     }
   });
 
+  // --- Al cerrar conexión
   ws.on("close", () => {
     console.log(`[${now()}] 🔴 ${userID} desconectado`.gray);
 
-    // Limpiar timer de inactividad
-    if (userStreams[ws] && userStreams[ws].inactivityTimer) {
-      clearInterval(userStreams[ws].inactivityTimer);
-    }
-
+    // Cerrar stream del usuario
     try {
-      if (userStreams[ws]) {
-        userStreams[ws].stream?.removeAllListeners();
-        userStreams[ws].stream?.end();
-        userStreams[ws].stream?.destroy();
-      }
+      userStreams[ws]?.end();
+      userStreams[ws]?.destroy();
     } catch (e) {
       console.warn(`[${now()}] ⚠️ Error cerrando stream: ${e.message}`);
     }
@@ -290,10 +187,11 @@ wss.on("connection", (ws, req) => {
     delete userStreams[ws];
     delete userMeta[ws];
 
+    // Eliminar del room
     if (rooms[callID]) {
       rooms[callID].delete(ws);
       if (rooms[callID].size === 0) {
-        console.log(`[${now()}] 🧹 Room ${callID} cerrado`.yellow);
+        console.log(`[${now()}] 🧹 Cerrando room vacío ${callID}`.yellow);
         delete rooms[callID];
       }
     }
@@ -304,6 +202,7 @@ wss.on("connection", (ws, req) => {
   });
 });
 
+// --- Endpoint de salud
 app.get("/health", (req, res) => {
   res.json({ ok: true, time: new Date().toISOString() });
 });
