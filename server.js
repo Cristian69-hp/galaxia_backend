@@ -21,12 +21,10 @@ if (process.env.GOOGLE_KEY_JSON) {
 
 // 🌍 Función para normalizar códigos de idioma
 function normalizarCodigoIdioma(codigo) {
-  // Si ya viene en formato completo (es-ES, en-US), retornar tal cual
   if (codigo && codigo.includes('-') && codigo.length > 2) {
     return codigo;
   }
 
-  // Mapeo de códigos cortos a formato completo para Google APIs
   const mapeo = {
     'es': 'es-ES',
     'en': 'en-US',
@@ -45,7 +43,6 @@ function normalizarCodigoIdioma(codigo) {
 // 🔄 Función para extraer código corto de idioma (para traducción)
 function extraerCodigoCorto(codigo) {
   if (!codigo) return 'en';
-  // Si viene "es-ES", extraer solo "es"
   if (codigo.includes('-')) {
     return codigo.split('-')[0];
   }
@@ -84,56 +81,88 @@ setInterval(() => {
 
 // --- Crear stream de reconocimiento individual
 function createRecognizeStream(ws, { callID, userID, sourceLang, targetLang }) {
-  // Normalizar códigos de idioma para Google STT
   const sourceLangNormalizado = normalizarCodigoIdioma(sourceLang);
   const targetLangCorto = extraerCodigoCorto(targetLang);
 
-  console.log(
-    `[${now()}] 🎙️ Creando STT para ${userID}`.yellow
-  );
-  console.log(`[${now()}]    - sourceLang original: ${sourceLang} -> normalizado: ${sourceLangNormalizado}`);
-  console.log(`[${now()}]    - targetLang original: ${targetLang} -> código corto: ${targetLangCorto}`);
+  console.log(`[${now()}] 🎙️ STT: ${userID} (${sourceLang} → ${targetLang})`.yellow);
+
+  // 🔥 Variable para almacenar el último texto procesado y evitar duplicados
+  let ultimoTextoProcesado = "";
+  let ultimoTimestamp = Date.now();
 
   const recognizeStream = clientSTT
     .streamingRecognize({
       config: {
         encoding: "LINEAR16",
         sampleRateHertz: 16000,
-        languageCode: sourceLangNormalizado, // ✅ Ahora usa código completo
+        languageCode: sourceLangNormalizado,
+        // ✅ OPTIMIZACIONES PARA VELOCIDAD
+        enableAutomaticPunctuation: true, // Puntuación automática
+        useEnhanced: true, // Modelo mejorado (más rápido)
+        model: 'latest_short', // Modelo optimizado para frases cortas
       },
-      interimResults: true,
+      interimResults: true, // Resultados intermedios para baja latencia
     })
     .on("error", (err) => {
       console.error(`[${now()}] ❌ Error STT (${userID}):`, err.message);
     })
     .on("data", async (data) => {
-      const texto = data.results[0]?.alternatives[0]?.transcript || "";
-      if (!texto) return;
-
       try {
-        // Traducción usando código corto (Google Translate usa códigos cortos)
+        const result = data.results[0];
+        if (!result) return;
+
+        const texto = result.alternatives[0]?.transcript || "";
+        if (!texto) return;
+
+        // ✅ SOLO procesar resultados FINALES para evitar spam
+        // Los interimResults se usan para iniciar rápido, pero solo enviamos finales
+        const isFinal = result.isFinal;
+        
+        // 🔥 OPTIMIZACIÓN: Reducir duplicados y spam
+        const ahora = Date.now();
+        const tiempoDesdeUltimo = ahora - ultimoTimestamp;
+        
+        // Solo procesar si:
+        // 1. Es resultado final, O
+        // 2. Ha pasado al menos 500ms desde el último mensaje (para interims)
+        if (!isFinal && tiempoDesdeUltimo < 500) {
+          return;
+        }
+
+        // Evitar procesar el mismo texto múltiples veces
+        if (texto === ultimoTextoProcesado && tiempoDesdeUltimo < 1000) {
+          return;
+        }
+
+        ultimoTextoProcesado = texto;
+        ultimoTimestamp = ahora;
+
+        // 🌍 TRADUCCIÓN RÁPIDA
         const [traduccion] = await clientTranslate.translate(texto, targetLangCorto);
 
         const payload = JSON.stringify({
           userID,
           texto_original: texto,
           traduccion,
-          sourceLang: sourceLangNormalizado, // Enviar código completo al cliente
+          sourceLang: sourceLangNormalizado,
           targetLang: targetLangCorto,
           timestamp: new Date().toISOString(),
+          isFinal, // Indicar si es resultado final
         });
 
-        // Enviar a todos los usuarios en el mismo room
+        // 📡 Enviar a todos los usuarios en el room
         rooms[callID]?.forEach((client) => {
           if (client.readyState === WebSocket.OPEN) {
             client.send(payload);
           }
         });
 
-        console.log(`[${now()}] 🗣️ ${userID}: ${texto}`.cyan);
-        console.log(`[${now()}] 🌍 Traducción (${sourceLangNormalizado}→${targetLangCorto}): ${traduccion}`.green);
+        // Log solo para finales (reducir spam en consola)
+        if (isFinal) {
+          console.log(`[${now()}] ✅ ${userID}: ${texto} → ${traduccion}`.cyan);
+        }
       } catch (e) {
-        console.error(`[${now()}] ⚠️ Error traduciendo (${userID}):`, e.message);
+        console.error(`[${now()}] ⚠️ Error (${userID}):`, e.message);
       }
     });
 
@@ -150,8 +179,7 @@ wss.on("connection", (ws, req) => {
   const sourceLang = url.searchParams.get("sourceLang") || "es";
   const targetLang = url.searchParams.get("targetLang") || "en";
 
-  console.log(`[${now()}] 🤝 ${userID} conectado a llamada ${callID}`.green);
-  console.log(`[${now()}]    - Configuración: ${sourceLang} → ${targetLang}`);
+  console.log(`[${now()}] 🤝 ${userID} → ${callID}`.green);
 
   // --- Añadir usuario al room
   if (!rooms[callID]) rooms[callID] = new Set();
@@ -167,8 +195,6 @@ wss.on("connection", (ws, req) => {
   ws.on("message", (msg) => {
     if (Buffer.isBuffer(msg)) {
       recognizeStream.write(msg);
-    } else {
-      console.log(`[${now()}] 📩 Mensaje control (${userID}):`, msg.toString());
     }
   });
 
@@ -176,7 +202,6 @@ wss.on("connection", (ws, req) => {
   ws.on("close", () => {
     console.log(`[${now()}] 🔴 ${userID} desconectado`.gray);
 
-    // Cerrar stream del usuario
     try {
       userStreams[ws]?.end();
       userStreams[ws]?.destroy();
@@ -187,11 +212,10 @@ wss.on("connection", (ws, req) => {
     delete userStreams[ws];
     delete userMeta[ws];
 
-    // Eliminar del room
     if (rooms[callID]) {
       rooms[callID].delete(ws);
       if (rooms[callID].size === 0) {
-        console.log(`[${now()}] 🧹 Cerrando room vacío ${callID}`.yellow);
+        console.log(`[${now()}] 🧹 Room ${callID} cerrado`.yellow);
         delete rooms[callID];
       }
     }
