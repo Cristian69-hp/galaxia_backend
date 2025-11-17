@@ -19,6 +19,39 @@ if (process.env.GOOGLE_KEY_JSON) {
   console.log(`[${now()}] 🔐 GOOGLE_KEY_JSON escrita a ${keyPath}`);
 }
 
+// 🌍 Función para normalizar códigos de idioma
+function normalizarCodigoIdioma(codigo) {
+  // Si ya viene en formato completo (es-ES, en-US), retornar tal cual
+  if (codigo && codigo.includes('-') && codigo.length > 2) {
+    return codigo;
+  }
+
+  // Mapeo de códigos cortos a formato completo para Google APIs
+  const mapeo = {
+    'es': 'es-ES',
+    'en': 'en-US',
+    'fr': 'fr-FR',
+    'de': 'de-DE',
+    'it': 'it-IT',
+    'pt': 'pt-PT',
+    'zh': 'zh-CN',
+    'ja': 'ja-JP',
+  };
+
+  const codigoLower = (codigo || 'en').toLowerCase();
+  return mapeo[codigoLower] || 'en-US';
+}
+
+// 🔄 Función para extraer código corto de idioma (para traducción)
+function extraerCodigoCorto(codigo) {
+  if (!codigo) return 'en';
+  // Si viene "es-ES", extraer solo "es"
+  if (codigo.includes('-')) {
+    return codigo.split('-')[0];
+  }
+  return codigo;
+}
+
 // --- Express + HTTP Server
 const app = express();
 app.use(express.json());
@@ -51,16 +84,22 @@ setInterval(() => {
 
 // --- Crear stream de reconocimiento individual
 function createRecognizeStream(ws, { callID, userID, sourceLang, targetLang }) {
+  // Normalizar códigos de idioma para Google STT
+  const sourceLangNormalizado = normalizarCodigoIdioma(sourceLang);
+  const targetLangCorto = extraerCodigoCorto(targetLang);
+
   console.log(
-    `[${now()}] 🎙️ Creando STT para ${userID} (${sourceLang} → ${targetLang})`.yellow
+    `[${now()}] 🎙️ Creando STT para ${userID}`.yellow
   );
+  console.log(`[${now()}]    - sourceLang original: ${sourceLang} -> normalizado: ${sourceLangNormalizado}`);
+  console.log(`[${now()}]    - targetLang original: ${targetLang} -> código corto: ${targetLangCorto}`);
 
   const recognizeStream = clientSTT
     .streamingRecognize({
       config: {
         encoding: "LINEAR16",
         sampleRateHertz: 16000,
-        languageCode: sourceLang,
+        languageCode: sourceLangNormalizado, // ✅ Ahora usa código completo
       },
       interimResults: true,
     })
@@ -72,15 +111,15 @@ function createRecognizeStream(ws, { callID, userID, sourceLang, targetLang }) {
       if (!texto) return;
 
       try {
-        // Traducción según idioma destino
-        const [traduccion] = await clientTranslate.translate(texto, targetLang);
+        // Traducción usando código corto (Google Translate usa códigos cortos)
+        const [traduccion] = await clientTranslate.translate(texto, targetLangCorto);
 
         const payload = JSON.stringify({
           userID,
           texto_original: texto,
           traduccion,
-          sourceLang,
-          targetLang,
+          sourceLang: sourceLangNormalizado, // Enviar código completo al cliente
+          targetLang: targetLangCorto,
           timestamp: new Date().toISOString(),
         });
 
@@ -91,8 +130,8 @@ function createRecognizeStream(ws, { callID, userID, sourceLang, targetLang }) {
           }
         });
 
-        console.log(`[${now()}] 🗣️ ${userID}: ${texto}`);
-        console.log(`[${now()}] 🌍 ${userID} (${sourceLang}→${targetLang}): ${traduccion}`);
+        console.log(`[${now()}] 🗣️ ${userID}: ${texto}`.cyan);
+        console.log(`[${now()}] 🌍 Traducción (${sourceLangNormalizado}→${targetLangCorto}): ${traduccion}`.green);
       } catch (e) {
         console.error(`[${now()}] ⚠️ Error traduciendo (${userID}):`, e.message);
       }
@@ -112,6 +151,7 @@ wss.on("connection", (ws, req) => {
   const targetLang = url.searchParams.get("targetLang") || "en";
 
   console.log(`[${now()}] 🤝 ${userID} conectado a llamada ${callID}`.green);
+  console.log(`[${now()}]    - Configuración: ${sourceLang} → ${targetLang}`);
 
   // --- Añadir usuario al room
   if (!rooms[callID]) rooms[callID] = new Set();
