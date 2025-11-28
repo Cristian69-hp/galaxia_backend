@@ -100,22 +100,35 @@ function createUserStream(userID, callID, sourceLang, targetLang, ws) {
     .on("error", (err) => {
       console.error(`[${now()}] ❌ Error STT para ${userID}:`, err.message);
       
-      // Recrear stream si el usuario aún está conectado
+      // ✅ MEJORADO: Solo recrear si el error es recuperable
       const userData = userConnections[userID];
       if (userData && userData.ws.readyState === WebSocket.OPEN) {
-        console.log(`[${now()}] 🔄 Recreando stream para ${userID}...`);
-        setTimeout(() => {
-          if (userConnections[userID]) {
-            const newStream = createUserStream(
-              userID, 
-              callID, 
-              sourceLang, 
-              targetLang, 
-              ws
-            );
-            userConnections[userID].stream = newStream;
-          }
-        }, 2000);
+        // Verificar si es un error recuperable
+        const isRecoverableError = 
+          err.message.includes('Timeout') || 
+          err.message.includes('network') ||
+          err.message.includes('UNAVAILABLE');
+        
+        if (isRecoverableError) {
+          console.log(`[${now()}] 🔄 Recreando stream para ${userID} (error recuperable)...`);
+          setTimeout(() => {
+            if (userConnections[userID]) {
+              try {
+                const newStream = createUserStream(
+                  userID, 
+                  callID, 
+                  sourceLang, 
+                  targetLang, 
+                  ws
+                );
+                userConnections[userID].stream = newStream;
+                console.log(`[${now()}] ✅ Stream recreado para ${userID}`);
+              } catch (e) {
+                console.error(`[${now()}] ❌ No se pudo recrear stream: ${e.message}`);
+              }
+            }
+          }, 2000);
+        }
       }
     })
     .on("end", () => {
@@ -221,11 +234,14 @@ wss.on("connection", (ws, req) => {
     lastTimestamp: 0,
   };
 
-  // ✅ Manejar audio entrante
+  // ✅ Manejar audio entrante con validación
   ws.on("message", (msg) => {
     if (Buffer.isBuffer(msg)) {
       const userData = userConnections[userID];
-      if (!userData) return;
+      if (!userData) {
+        console.warn(`[${now()}] ⚠️ Audio recibido pero usuario ${userID} no existe`);
+        return;
+      }
 
       const stream = userData.stream;
       if (stream && stream.writable && !stream.destroyed) {
@@ -233,9 +249,23 @@ wss.on("connection", (ws, req) => {
           stream.write(msg);
         } catch (e) {
           console.warn(`[${now()}] ⚠️ Error escribiendo audio para ${userID}: ${e.message}`);
+          // Intentar recrear stream
+          try {
+            const newStream = createUserStream(userID, callID, userData.sourceLang, userData.targetLang, ws);
+            userData.stream = newStream;
+            console.log(`[${now()}] 🔄 Stream recreado automáticamente para ${userID}`);
+          } catch (err) {
+            console.error(`[${now()}] ❌ No se pudo recrear stream: ${err.message}`);
+          }
         }
       } else {
-        console.warn(`[${now()}] ⚠️ Stream no disponible para ${userID}`);
+        console.warn(`[${now()}] ⚠️ Stream no disponible para ${userID}, recreando...`);
+        try {
+          const newStream = createUserStream(userID, callID, userData.sourceLang, userData.targetLang, ws);
+          userData.stream = newStream;
+        } catch (err) {
+          console.error(`[${now()}] ❌ Error recreando stream: ${err.message}`);
+        }
       }
     }
   });
