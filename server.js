@@ -31,7 +31,7 @@ function normalizarCodigoIdioma(codigo) {
     'fr': 'fr-FR',
     'de': 'de-DE',
     'it': 'it-IT',
-    'pt': 'pt-PT',
+    'pt': 'PT-BR',
     'zh': 'zh-CN',
     'ja': 'ja-JP',
   };
@@ -69,38 +69,22 @@ server.listen(PORT, () => {
   console.log("🚀 Esperando conexiones WebSocket...\n".yellow);
 });
 
-// --- Estructuras de conexión
-const rooms = {}; // callID -> Set<ws>
-const userMeta = {}; // ws -> { callID, userID, sourceLang, targetLang }
-const roomStreams = {}; // callID -> { stream, users: Map<userID, { sourceLang, targetLang }> }
-const audioBuffer = {}; // callID -> chunks pendientes
+// --- Estructuras de conexión (NUEVAS)
+const rooms = {}; // callID -> Set<userID>
+const userConnections = {}; // userID -> { ws, callID, sourceLang, targetLang, stream, lastText, lastTimestamp }
+const callParticipants = {}; // callID -> Map<userID, { sourceLang, targetLang }>
 
 // Mantener conexión viva
 setInterval(() => {
   wss.clients.forEach((c) => c.readyState === WebSocket.OPEN && c.ping());
 }, 25000);
 
-// --- Crear stream de reconocimiento POR ROOM (compartido)
-function createRoomStream(callID) {
-  if (roomStreams[callID] && !roomStreams[callID].stream.destroyed) {
-    console.log(`[${now()}] ℹ️ Stream ya existe para room ${callID}`);
-    return roomStreams[callID].stream;
-  }
-
-  console.log(`[${now()}] 🎙️ Creando stream compartido para room ${callID}`.yellow);
-
-  // Usar el idioma del PRIMER usuario que se conecte
-  const firstUser = Array.from(rooms[callID] || [])[0];
-  const firstMeta = firstUser ? userMeta[firstUser] : null;
+// --- Crear stream de reconocimiento POR USUARIO (NO compartido)
+function createUserStream(userID, callID, sourceLang, targetLang, ws) {
+  console.log(`[${now()}] 🎙️ Creando stream individual para ${userID}`.yellow);
   
-  if (!firstMeta) {
-    console.error(`[${now()}] ❌ No hay usuarios en room ${callID}`);
-    return null;
-  }
-
-  const sourceLangNormalizado = normalizarCodigoIdioma(firstMeta.sourceLang);
-
-  console.log(`[${now()}]    - Idioma de STT: ${sourceLangNormalizado}`);
+  const sourceLangNormalizado = normalizarCodigoIdioma(sourceLang);
+  console.log(`[${now()}]    - Idioma STT: ${sourceLangNormalizado}`);
 
   const recognizeStream = clientSTT
     .streamingRecognize({
@@ -108,77 +92,91 @@ function createRoomStream(callID) {
         encoding: "LINEAR16",
         sampleRateHertz: 16000,
         languageCode: sourceLangNormalizado,
+        enableAutomaticPunctuation: true,
+        model: "default",
       },
-      interimResults: true,
+      interimResults: false, // ✅ SOLO RESULTADOS FINALES (evita duplicados)
     })
     .on("error", (err) => {
-      console.error(`[${now()}] ❌ Error STT en room ${callID}:`, err.message);
-      // Recrear stream
-      delete roomStreams[callID];
-      if (rooms[callID] && rooms[callID].size > 0) {
+      console.error(`[${now()}] ❌ Error STT para ${userID}:`, err.message);
+      
+      // Recrear stream si el usuario aún está conectado
+      const userData = userConnections[userID];
+      if (userData && userData.ws.readyState === WebSocket.OPEN) {
+        console.log(`[${now()}] 🔄 Recreando stream para ${userID}...`);
         setTimeout(() => {
-          createRoomStream(callID);
+          if (userConnections[userID]) {
+            const newStream = createUserStream(
+              userID, 
+              callID, 
+              sourceLang, 
+              targetLang, 
+              ws
+            );
+            userConnections[userID].stream = newStream;
+          }
         }, 2000);
       }
     })
     .on("end", () => {
-      console.log(`[${now()}] ⚠️ Stream STT terminó para room ${callID}`.yellow);
-      delete roomStreams[callID];
-      
-      // Recrear si aún hay usuarios
-      if (rooms[callID] && rooms[callID].size > 0) {
-        setTimeout(() => {
-          createRoomStream(callID);
-        }, 1000);
-      }
+      console.log(`[${now()}] ⚠️ Stream STT terminó para ${userID}`.yellow);
     })
     .on("data", async (data) => {
       const texto = data.results[0]?.alternatives[0]?.transcript || "";
-      if (!texto) return;
+      if (!texto || texto.trim().length === 0) return;
 
-      try {
-        // 🔑 IMPORTANTE: Cada usuario recibe la traducción a SU idioma
-        const users = roomStreams[callID]?.users || new Map();
-        
-        for (const [userID, userConfig] of users) {
-          const targetLangCorto = extraerCodigoCorto(userConfig.targetLang);
+      const userData = userConnections[userID];
+      if (!userData) return;
 
-          try {
-            const [traduccion] = await clientTranslate.translate(texto, targetLangCorto);
+      // ✅ DEDUPLICACIÓN: Evitar procesar el mismo texto múltiples veces
+      const ahora = Date.now();
+      if (userData.lastText === texto && (ahora - userData.lastTimestamp) < 3000) {
+        console.log(`[${now()}] ⏭️ Texto duplicado ignorado de ${userID}: "${texto}"`);
+        return;
+      }
 
-            const payload = JSON.stringify({
-              userID: firstMeta.userID, // Quien habló (del primer idioma)
-              texto_original: texto,
-              traduccion,
-              sourceLang: sourceLangNormalizado,
-              targetLang: targetLangCorto,
-              timestamp: new Date().toISOString(),
-            });
+      // Actualizar último texto procesado
+      userData.lastText = texto;
+      userData.lastTimestamp = ahora;
 
-            // Enviar a TODOS (cada uno vera su traducción)
-            if (rooms[callID]) {
-              rooms[callID].forEach((client) => {
-                if (client.readyState === WebSocket.OPEN) {
-                  client.send(payload);
-                }
-              });
-            }
+      console.log(`[${now()}] 🗣️ ${userID}: ${texto}`.cyan);
 
-            console.log(`[${now()}] 🗣️ ${firstMeta.userID}: ${texto}`.cyan);
-            console.log(`[${now()}] 🌍 Traducción (${sourceLangNormalizado}→${targetLangCorto}): ${traduccion}`.green);
-          } catch (e) {
-            console.error(`[${now()}] ⚠️ Error traduciendo para ${userID}:`, e.message);
-          }
+      // ✅ Traducir y enviar SOLO a los OTROS usuarios en el mismo callID
+      const participants = callParticipants[callID];
+      if (!participants) return;
+
+      for (const [otherUserID, otherUserConfig] of participants) {
+        // ❌ NO enviar al usuario que está hablando
+        if (otherUserID === userID) continue;
+
+        const otherConnection = userConnections[otherUserID];
+        if (!otherConnection || otherConnection.ws.readyState !== WebSocket.OPEN) {
+          continue;
         }
-      } catch (e) {
-        console.error(`[${now()}] ⚠️ Error procesando datos:`, e.message);
+
+        try {
+          // Traducir al idioma del OTRO usuario
+          const targetLangCorto = extraerCodigoCorto(otherUserConfig.targetLang);
+          const [traduccion] = await clientTranslate.translate(texto, targetLangCorto);
+
+          const payload = JSON.stringify({
+            userID: userID, // Quien habló
+            texto_original: texto,
+            traduccion: traduccion,
+            sourceLang: sourceLangNormalizado,
+            targetLang: targetLangCorto,
+            timestamp: new Date().toISOString(),
+          });
+
+          // ✅ Enviar SOLO al otro usuario
+          otherConnection.ws.send(payload);
+
+          console.log(`[${now()}] 🌍 Traducción enviada a ${otherUserID} (${sourceLangNormalizado}→${targetLangCorto}): ${traduccion}`.green);
+        } catch (e) {
+          console.error(`[${now()}] ⚠️ Error traduciendo para ${otherUserID}:`, e.message);
+        }
       }
     });
-
-  roomStreams[callID] = {
-    stream: recognizeStream,
-    users: new Map(),
-  };
 
   return recognizeStream;
 }
@@ -193,80 +191,87 @@ wss.on("connection", (ws, req) => {
   const targetLang = url.searchParams.get("targetLang") || "en";
 
   console.log(`[${now()}] 🤝 ${userID} conectado a room ${callID}`.green);
-  console.log(`[${now()}]    - ${sourceLang} → ${targetLang}`);
+  console.log(`[${now()}]    - Idioma origen: ${sourceLang}`);
+  console.log(`[${now()}]    - Idioma destino: ${targetLang}`);
 
-  // Añadir al room
-  if (!rooms[callID]) rooms[callID] = new Set();
-  rooms[callID].add(ws);
+  // ✅ Inicializar room si no existe
+  if (!rooms[callID]) {
+    rooms[callID] = new Set();
+    callParticipants[callID] = new Map();
+  }
+
+  // ✅ Agregar usuario al room
+  rooms[callID].add(userID);
+  callParticipants[callID].set(userID, { sourceLang, targetLang });
   console.log(`[${now()}]    - Usuarios en room: ${rooms[callID].size}`);
 
-  // Guardar metadatos
-  userMeta[ws] = { callID, userID, sourceLang, targetLang };
+  // ✅ Crear stream individual para este usuario
+  const stream = createUserStream(userID, callID, sourceLang, targetLang, ws);
 
-  // Actualizar stream compartido con info del usuario
-  if (!roomStreams[callID]) {
-    createRoomStream(callID);
-  }
-  
-  if (roomStreams[callID]) {
-    roomStreams[callID].users.set(userID, { sourceLang, targetLang });
-  }
+  // ✅ Guardar conexión del usuario
+  userConnections[userID] = {
+    ws,
+    callID,
+    sourceLang,
+    targetLang,
+    stream,
+    lastText: "",
+    lastTimestamp: 0,
+  };
 
-  // Manejar audio
+  // ✅ Manejar audio entrante
   ws.on("message", (msg) => {
     if (Buffer.isBuffer(msg)) {
-      const stream = roomStreams[callID]?.stream;
+      const userData = userConnections[userID];
+      if (!userData) return;
+
+      const stream = userData.stream;
       if (stream && stream.writable && !stream.destroyed) {
         try {
           stream.write(msg);
         } catch (e) {
-          console.warn(`[${now()}] ⚠️ Error escribiendo audio: ${e.message}`);
+          console.warn(`[${now()}] ⚠️ Error escribiendo audio para ${userID}: ${e.message}`);
         }
       } else {
-        console.warn(`[${now()}] ⚠️ Stream no disponible para room ${callID}`);
+        console.warn(`[${now()}] ⚠️ Stream no disponible para ${userID}`);
       }
     }
   });
 
-  // Al cerrar
+  // ✅ Al cerrar conexión
   ws.on("close", () => {
     console.log(`[${now()}] 🔴 ${userID} desconectado`.gray);
 
-    const meta = userMeta[ws];
-    if (meta) {
-      // Eliminar del room
-      if (rooms[meta.callID]) {
-        rooms[meta.callID].delete(ws);
-        console.log(`[${now()}]    - Usuarios en room: ${rooms[meta.callID].size}`);
+    const userData = userConnections[userID];
+    if (userData) {
+      // Cerrar stream del usuario
+      try {
+        if (userData.stream && !userData.stream.destroyed) {
+          userData.stream.end();
+          userData.stream.destroy();
+        }
+      } catch (e) {
+        console.warn(`[${now()}] ⚠️ Error cerrando stream de ${userID}: ${e.message}`);
+      }
 
-        // Si el room queda vacía, limpiar stream
-        if (rooms[meta.callID].size === 0) {
-          console.log(`[${now()}] 🧹 Room ${meta.callID} vacía, cerrando stream`.yellow);
-          
-          if (roomStreams[meta.callID]) {
-            try {
-              const stream = roomStreams[meta.callID].stream;
-              if (stream && !stream.destroyed) {
-                stream.end();
-                stream.destroy();
-              }
-            } catch (e) {
-              console.warn(`[${now()}] ⚠️ Error cerrando stream: ${e.message}`);
-            }
-            delete roomStreams[meta.callID];
-          }
-          
-          delete rooms[meta.callID];
-        } else {
-          // Eliminar usuario del mapa de usuarios del stream
-          if (roomStreams[meta.callID]) {
-            roomStreams[meta.callID].users.delete(userID);
-          }
+      // Eliminar del room
+      if (rooms[userData.callID]) {
+        rooms[userData.callID].delete(userID);
+        callParticipants[userData.callID]?.delete(userID);
+        
+        console.log(`[${now()}]    - Usuarios restantes en room: ${rooms[userData.callID].size}`);
+
+        // Si el room queda vacío, limpiar
+        if (rooms[userData.callID].size === 0) {
+          console.log(`[${now()}] 🧹 Room ${userData.callID} vacío, limpiando`.yellow);
+          delete rooms[userData.callID];
+          delete callParticipants[userData.callID];
         }
       }
-    }
 
-    delete userMeta[ws];
+      // Eliminar conexión del usuario
+      delete userConnections[userID];
+    }
   });
 
   ws.on("error", (err) => {
@@ -276,5 +281,23 @@ wss.on("connection", (ws, req) => {
 
 // --- Endpoint de salud
 app.get("/health", (req, res) => {
-  res.json({ ok: true, time: new Date().toISOString() });
+  res.json({ 
+    ok: true, 
+    time: new Date().toISOString(),
+    activeRooms: Object.keys(rooms).length,
+    activeUsers: Object.keys(userConnections).length,
+  });
+});
+
+// --- Endpoint para debug
+app.get("/debug", (req, res) => {
+  const roomsInfo = {};
+  for (const [callID, users] of Object.entries(rooms)) {
+    roomsInfo[callID] = Array.from(users);
+  }
+  
+  res.json({
+    rooms: roomsInfo,
+    activeConnections: Object.keys(userConnections).length,
+  });
 });
