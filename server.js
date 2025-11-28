@@ -31,7 +31,7 @@ function normalizarCodigoIdioma(codigo) {
     'fr': 'fr-FR',
     'de': 'de-DE',
     'it': 'it-IT',
-    'pt': 'PT-BR',
+    'pt': 'pt-BR',
     'zh': 'zh-CN',
     'ja': 'ja-JP',
   };
@@ -69,7 +69,7 @@ server.listen(PORT, () => {
   console.log("🚀 Esperando conexiones WebSocket...\n".yellow);
 });
 
-// --- Estructuras de conexión (NUEVAS)
+// --- Estructuras de conexión
 const rooms = {}; // callID -> Set<userID>
 const userConnections = {}; // userID -> { ws, callID, sourceLang, targetLang, stream, lastText, lastTimestamp }
 const callParticipants = {}; // callID -> Map<userID, { sourceLang, targetLang }>
@@ -158,6 +158,12 @@ function createUserStream(userID, callID, sourceLang, targetLang, ws) {
       const participants = callParticipants[callID];
       if (!participants) return;
 
+      // 🔥 OBTENER EL IDIOMA FUENTE DEL EMISOR
+      const emisorConfig = participants.get(userID);
+      if (!emisorConfig) return;
+      
+      const sourceLangCorto = extraerCodigoCorto(emisorConfig.sourceLang);
+
       for (const [recipientUserID, recipientConfig] of participants) {
         const recipientConnection = userConnections[recipientUserID];
         if (!recipientConnection || recipientConnection.ws.readyState !== WebSocket.OPEN) {
@@ -165,27 +171,49 @@ function createUserStream(userID, callID, sourceLang, targetLang, ws) {
         }
 
         try {
-          // Traducir al idioma del destinatario
-          const targetLangCorto = extraerCodigoCorto(recipientConfig.targetLang);
-          const [traduccion] = await clientTranslate.translate(texto, targetLangCorto);
+          // 🔥 CORRECCIÓN PRINCIPAL: Lógica de traducción correcta
+          let targetLangCorto;
+          let traduccion;
+          
+          if (recipientUserID === userID) {
+            // ✅ Es el EMISOR: Mostrar su propia traducción (sourceLang → targetLang)
+            targetLangCorto = extraerCodigoCorto(recipientConfig.targetLang);
+            
+            // Si source y target son iguales, no traducir
+            if (sourceLangCorto === targetLangCorto) {
+              traduccion = texto;
+            } else {
+              [traduccion] = await clientTranslate.translate(texto, targetLangCorto);
+            }
+          } else {
+            // ✅ Es OTRO USUARIO: Traducir AL IDIOMA QUE ÉL HABLA (sourceLang del receptor)
+            targetLangCorto = extraerCodigoCorto(recipientConfig.sourceLang);
+            
+            // Solo traducir si los idiomas son diferentes
+            if (sourceLangCorto === targetLangCorto) {
+              traduccion = texto; // Mismo idioma, no traducir
+            } else {
+              [traduccion] = await clientTranslate.translate(texto, targetLangCorto);
+            }
+          }
 
           const payload = JSON.stringify({
             userID: userID, // Quien habló
             texto_original: texto,
             traduccion: traduccion,
-            sourceLang: sourceLangNormalizado,
+            sourceLang: sourceLangCorto,
             targetLang: targetLangCorto,
             timestamp: new Date().toISOString(),
-            isSelf: recipientUserID === userID, // ✅ NUEVA BANDERA
+            isSelf: recipientUserID === userID,
           });
 
           // ✅ Enviar a TODOS (incluido el emisor)
           recipientConnection.ws.send(payload);
 
           if (recipientUserID === userID) {
-            console.log(`[${now()}] 📤 Transcripción enviada al emisor (para UI)`.gray);
+            console.log(`[${now()}] 📤 Transcripción enviada al emisor (${sourceLangCorto}→${targetLangCorto})`.gray);
           } else {
-            console.log(`[${now()}] 🌍 Traducción enviada a ${recipientUserID} (${sourceLangNormalizado}→${targetLangCorto}): ${traduccion}`.green);
+            console.log(`[${now()}] 🌍 Traducción enviada a ${recipientUserID} (${sourceLangCorto}→${targetLangCorto}): ${traduccion}`.green);
           }
         } catch (e) {
           console.error(`[${now()}] ⚠️ Error traduciendo para ${recipientUserID}:`, e.message);
@@ -206,8 +234,8 @@ wss.on("connection", (ws, req) => {
   const targetLang = url.searchParams.get("targetLang") || "en";
 
   console.log(`[${now()}] 🤝 ${userID} conectado a room ${callID}`.green);
-  console.log(`[${now()}]    - Idioma origen: ${sourceLang}`);
-  console.log(`[${now()}]    - Idioma destino: ${targetLang}`);
+  console.log(`[${now()}]    - Idioma origen (habla): ${sourceLang}`);
+  console.log(`[${now()}]    - Idioma destino (escucha): ${targetLang}`);
 
   // ✅ Inicializar room si no existe
   if (!rooms[callID]) {
