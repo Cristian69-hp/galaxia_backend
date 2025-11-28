@@ -76,6 +76,7 @@ server.listen(PORT, () => {
 const rooms = {}; // callID -> Set<ws>
 const userMeta = {}; // ws -> { callID, userID, sourceLang, targetLang }
 const userStreams = {}; // ws -> recognizeStream
+const streamTimeouts = {}; // ws -> timeout ID para limpiar
 
 // Mantener conexión viva
 setInterval(() => {
@@ -84,6 +85,17 @@ setInterval(() => {
 
 // --- Crear stream de reconocimiento individual
 function createRecognizeStream(ws, { callID, userID, sourceLang, targetLang }) {
+  // Si ya existe un stream, cerrarlo primero
+  if (userStreams[ws]) {
+    try {
+      userStreams[ws].end();
+      userStreams[ws].destroy();
+    } catch (e) {
+      console.warn(`[${now()}] ⚠️ Error limpiando stream anterior: ${e.message}`);
+    }
+    delete userStreams[ws];
+  }
+
   // Normalizar códigos de idioma para Google STT
   const sourceLangNormalizado = normalizarCodigoIdioma(sourceLang);
   const targetLangCorto = extraerCodigoCorto(targetLang);
@@ -105,6 +117,27 @@ function createRecognizeStream(ws, { callID, userID, sourceLang, targetLang }) {
     })
     .on("error", (err) => {
       console.error(`[${now()}] ❌ Error STT (${userID}):`, err.message);
+      // Intentar recrear el stream en caso de error
+      if (userMeta[ws]) {
+        console.log(`[${now()}] 🔄 Recreando stream después de error para ${userID}...`.yellow);
+        setTimeout(() => {
+          if (userMeta[ws]) {
+            createRecognizeStream(ws, userMeta[ws]);
+          }
+        }, 1000);
+      }
+    })
+    .on("end", () => {
+      console.log(`[${now()}] ⚠️ Stream STT terminó para ${userID}`.yellow);
+      // Recrear el stream cuando termina
+      if (userMeta[ws]) {
+        console.log(`[${now()}] 🔄 Recreando stream para ${userID}...`.yellow);
+        setTimeout(() => {
+          if (userMeta[ws] && ws.readyState === WebSocket.OPEN) {
+            createRecognizeStream(ws, userMeta[ws]);
+          }
+        }, 500);
+      }
     })
     .on("data", async (data) => {
       const texto = data.results[0]?.alternatives[0]?.transcript || "";
@@ -124,11 +157,13 @@ function createRecognizeStream(ws, { callID, userID, sourceLang, targetLang }) {
         });
 
         // Enviar a todos los usuarios en el mismo room
-        rooms[callID]?.forEach((client) => {
-          if (client.readyState === WebSocket.OPEN) {
-            client.send(payload);
-          }
-        });
+        if (rooms[callID]) {
+          rooms[callID].forEach((client) => {
+            if (client.readyState === WebSocket.OPEN) {
+              client.send(payload);
+            }
+          });
+        }
 
         console.log(`[${now()}] 🗣️ ${userID}: ${texto}`.cyan);
         console.log(`[${now()}] 🌍 Traducción (${sourceLangNormalizado}→${targetLangCorto}): ${traduccion}`.green);
@@ -166,7 +201,13 @@ wss.on("connection", (ws, req) => {
   // --- Manejar mensajes (audio)
   ws.on("message", (msg) => {
     if (Buffer.isBuffer(msg)) {
-      recognizeStream.write(msg);
+      // ✅ Validar que el stream exista y esté listo antes de escribir
+      const stream = userStreams[ws];
+      if (stream && stream.writable && !stream.destroyed) {
+        stream.write(msg);
+      } else {
+        console.warn(`[${now()}] ⚠️ Stream no está listo para escribir para ${userID}`);
+      }
     } else {
       console.log(`[${now()}] 📩 Mensaje control (${userID}):`, msg.toString());
     }
@@ -176,10 +217,21 @@ wss.on("connection", (ws, req) => {
   ws.on("close", () => {
     console.log(`[${now()}] 🔴 ${userID} desconectado`.gray);
 
+    // Limpiar timeout si existe
+    if (streamTimeouts[ws]) {
+      clearTimeout(streamTimeouts[ws]);
+      delete streamTimeouts[ws];
+    }
+
     // Cerrar stream del usuario
     try {
-      userStreams[ws]?.end();
-      userStreams[ws]?.destroy();
+      const stream = userStreams[ws];
+      if (stream) {
+        if (!stream.destroyed) {
+          stream.end();
+          stream.destroy();
+        }
+      }
     } catch (e) {
       console.warn(`[${now()}] ⚠️ Error cerrando stream: ${e.message}`);
     }
