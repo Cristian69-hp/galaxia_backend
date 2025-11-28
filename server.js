@@ -141,22 +141,19 @@ function createUserStream(userID, callID, sourceLang, targetLang, ws) {
 
       console.log(`[${now()}] 🗣️ ${userID}: ${texto}`.cyan);
 
-      // ✅ Traducir y enviar SOLO a los OTROS usuarios en el mismo callID
+      // ✅ Traducir y enviar a TODOS los usuarios (incluyendo el emisor para UI)
       const participants = callParticipants[callID];
       if (!participants) return;
 
-      for (const [otherUserID, otherUserConfig] of participants) {
-        // ❌ NO enviar al usuario que está hablando
-        if (otherUserID === userID) continue;
-
-        const otherConnection = userConnections[otherUserID];
-        if (!otherConnection || otherConnection.ws.readyState !== WebSocket.OPEN) {
+      for (const [recipientUserID, recipientConfig] of participants) {
+        const recipientConnection = userConnections[recipientUserID];
+        if (!recipientConnection || recipientConnection.ws.readyState !== WebSocket.OPEN) {
           continue;
         }
 
         try {
-          // Traducir al idioma del OTRO usuario
-          const targetLangCorto = extraerCodigoCorto(otherUserConfig.targetLang);
+          // Traducir al idioma del destinatario
+          const targetLangCorto = extraerCodigoCorto(recipientConfig.targetLang);
           const [traduccion] = await clientTranslate.translate(texto, targetLangCorto);
 
           const payload = JSON.stringify({
@@ -166,14 +163,19 @@ function createUserStream(userID, callID, sourceLang, targetLang, ws) {
             sourceLang: sourceLangNormalizado,
             targetLang: targetLangCorto,
             timestamp: new Date().toISOString(),
+            isSelf: recipientUserID === userID, // ✅ NUEVA BANDERA
           });
 
-          // ✅ Enviar SOLO al otro usuario
-          otherConnection.ws.send(payload);
+          // ✅ Enviar a TODOS (incluido el emisor)
+          recipientConnection.ws.send(payload);
 
-          console.log(`[${now()}] 🌍 Traducción enviada a ${otherUserID} (${sourceLangNormalizado}→${targetLangCorto}): ${traduccion}`.green);
+          if (recipientUserID === userID) {
+            console.log(`[${now()}] 📤 Transcripción enviada al emisor (para UI)`.gray);
+          } else {
+            console.log(`[${now()}] 🌍 Traducción enviada a ${recipientUserID} (${sourceLangNormalizado}→${targetLangCorto}): ${traduccion}`.green);
+          }
         } catch (e) {
-          console.error(`[${now()}] ⚠️ Error traduciendo para ${otherUserID}:`, e.message);
+          console.error(`[${now()}] ⚠️ Error traduciendo para ${recipientUserID}:`, e.message);
         }
       }
     });
